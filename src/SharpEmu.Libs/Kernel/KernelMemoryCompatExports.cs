@@ -1445,6 +1445,51 @@ public static class KernelMemoryCompatExports
     }
 
     [SysAbiExport(
+        Nid = "Oy6IpwgtYOk",
+        ExportName = "lseek",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PosixLseek(CpuContext ctx)
+    {
+        var result = KernelLseekCore(
+            unchecked((int)ctx[CpuRegister.Rdi]),
+            unchecked((long)ctx[CpuRegister.Rsi]),
+            unchecked((int)ctx[CpuRegister.Rdx]),
+            out var position);
+
+        if (result != OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            ctx[CpuRegister.Rax] = ulong.MaxValue;
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)position);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "oib76F-12fk",
+        ExportName = "sceKernelLseek",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int KernelLseek(CpuContext ctx)
+    {
+        var result = KernelLseekCore(
+            unchecked((int)ctx[CpuRegister.Rdi]),
+            unchecked((long)ctx[CpuRegister.Rsi]),
+            unchecked((int)ctx[CpuRegister.Rdx]),
+            out var position);
+
+        if (result != OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return (int)result;
+        }
+
+        ctx[CpuRegister.Rax] = unchecked((ulong)position);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "taRWhTJFTgE",
         ExportName = "sceKernelGetdirentries",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1472,6 +1517,58 @@ public static class KernelMemoryCompatExports
             ctx[CpuRegister.Rsi],
             unchecked((int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue)),
             0);
+    }
+
+    private static OrbisGen2Result KernelLseekCore(int fd, long offset, int whence, out long position)
+    {
+        position = -1;
+
+        FileStream? stream;
+        lock (_fdGate)
+        {
+            _openFiles.TryGetValue(fd, out stream);
+        }
+
+        if (stream is null)
+        {
+            LogIoTrace("lseek", $"fd:{fd}", $"offset={offset} whence={whence} result=badfd");
+            return OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
+        SeekOrigin origin;
+        switch (whence)
+        {
+            case SeekSet:
+                origin = SeekOrigin.Begin;
+                break;
+            case SeekCur:
+                origin = SeekOrigin.Current;
+                break;
+            case SeekEnd:
+                origin = SeekOrigin.End;
+                break;
+            default:
+                LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=invalid_whence");
+                return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        try
+        {
+            position = stream.Seek(offset, origin);
+        }
+        catch (IOException ex)
+        {
+            LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=io_error ex={ex.Message}");
+            return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+        catch (ArgumentException ex)
+        {
+            LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=invalid ex={ex.Message}");
+            return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} pos={position}");
+        return OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
     [SysAbiExport(
@@ -3567,13 +3664,13 @@ public static class KernelMemoryCompatExports
         var devlogAppRoot = ResolveDevlogAppRoot();
         if (guestPath.StartsWith("/devlog/app/", StringComparison.OrdinalIgnoreCase))
         {
-            var relative = guestPath["/devlog/app/".Length..].Replace('/', Path.DirectorySeparatorChar);
+            var relative = NormalizeMountRelativePath(guestPath["/devlog/app/".Length..]);
             return Path.Combine(devlogAppRoot, relative);
         }
 
         if (guestPath.StartsWith("devlog/app/", StringComparison.OrdinalIgnoreCase))
         {
-            var relative = guestPath["devlog/app/".Length..].Replace('/', Path.DirectorySeparatorChar);
+            var relative = NormalizeMountRelativePath(guestPath["devlog/app/".Length..]);
             return Path.Combine(devlogAppRoot, relative);
         }
 
@@ -3586,7 +3683,7 @@ public static class KernelMemoryCompatExports
         var temp0Root = ResolveTemp0Root();
         if (guestPath.StartsWith("/temp0/", StringComparison.OrdinalIgnoreCase))
         {
-            var relative = guestPath["/temp0/".Length..].Replace('/', Path.DirectorySeparatorChar);
+            var relative = NormalizeMountRelativePath(guestPath["/temp0/".Length..]);
             return Path.Combine(temp0Root, relative);
         }
 
@@ -3606,13 +3703,13 @@ public static class KernelMemoryCompatExports
 
             if (guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
             {
-                var relative = guestPath["/app0/".Length..].Replace('/', Path.DirectorySeparatorChar);
+                var relative = NormalizeMountRelativePath(guestPath["/app0/".Length..]);
                 return Path.Combine(app0Root, relative);
             }
 
             if (guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
             {
-                var relative = guestPath["app0/".Length..].Replace('/', Path.DirectorySeparatorChar);
+                var relative = NormalizeMountRelativePath(guestPath["app0/".Length..]);
                 return Path.Combine(app0Root, relative);
             }
 
@@ -3626,6 +3723,14 @@ public static class KernelMemoryCompatExports
         }
 
         return guestPath;
+    }
+
+    private static string NormalizeMountRelativePath(string relativePath)
+    {
+        return relativePath
+            .TrimStart('/', '\\')
+            .Replace('/', Path.DirectorySeparatorChar)
+            .Replace('\\', Path.DirectorySeparatorChar);
     }
 
     private static string ResolveDevlogAppRoot()

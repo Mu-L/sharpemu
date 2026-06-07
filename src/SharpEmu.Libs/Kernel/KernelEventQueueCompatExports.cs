@@ -9,9 +9,20 @@ namespace SharpEmu.Libs.Kernel;
 
 public static class KernelEventQueueCompatExports
 {
+    private const int KernelEventSize = 0x20;
+
     private static readonly object _eventQueueGate = new();
     private static readonly HashSet<ulong> _eventQueues = new();
+    private static readonly Dictionary<ulong, Queue<KernelQueuedEvent>> _pendingEvents = new();
     private static long _nextEventQueueHandle = 1;
+
+    public readonly record struct KernelQueuedEvent(
+        ulong Ident,
+        short Filter,
+        ushort Flags,
+        uint Fflags,
+        ulong Data,
+        ulong UserData);
 
     [SysAbiExport(
         Nid = "D0OdFMjp46I",
@@ -30,6 +41,7 @@ public static class KernelEventQueueCompatExports
         lock (_eventQueueGate)
         {
             _eventQueues.Add(handle);
+            _pendingEvents[handle] = new Queue<KernelQueuedEvent>();
         }
 
         if (!ctx.TryWriteUInt64(outAddress, handle))
@@ -52,6 +64,7 @@ public static class KernelEventQueueCompatExports
         lock (_eventQueueGate)
         {
             _eventQueues.Remove(handle);
+            _pendingEvents.Remove(handle);
         }
 
         TraceEventQueue(ctx, "delete", handle);
@@ -165,21 +178,106 @@ public static class KernelEventQueueCompatExports
         LibraryName = "libKernel")]
     public static int KernelWaitEqueue(CpuContext ctx)
     {
+        var handle = ctx[CpuRegister.Rdi];
+        var eventsAddress = ctx[CpuRegister.Rsi];
+        var eventCapacity = (int)Math.Min(ctx[CpuRegister.Rdx], int.MaxValue);
         var outCountAddress = ctx[CpuRegister.Rcx];
         var timeoutAddress = ctx[CpuRegister.R8];
-        if (outCountAddress != 0 && !TryWriteUInt32(ctx, outCountAddress, 0))
+
+        var deliveredCount = DequeueEvents(ctx, handle, eventsAddress, eventCapacity);
+        if (outCountAddress != 0 && !TryWriteUInt32(ctx, outCountAddress, (uint)deliveredCount))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (timeoutAddress == 0 && GuestThreadExecution.RequestCurrentThreadBlock("sceKernelWaitEqueue"))
+        if (deliveredCount > 0)
         {
-            TraceEventQueue(ctx, "wait-block", ctx[CpuRegister.Rdi]);
+            TraceEventQueue(ctx, "wait-deliver", handle);
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        TraceEventQueue(ctx, "wait", ctx[CpuRegister.Rdi]);
+        if (timeoutAddress == 0 && GuestThreadExecution.RequestCurrentThreadBlock("sceKernelWaitEqueue"))
+        {
+            TraceEventQueue(ctx, "wait-block", handle);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        TraceEventQueue(ctx, "wait", handle);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    public static bool IsValidEqueue(ulong handle)
+    {
+        lock (_eventQueueGate)
+        {
+            return _eventQueues.Contains(handle);
+        }
+    }
+
+    public static bool EnqueueEvent(ulong handle, KernelQueuedEvent queuedEvent)
+    {
+        lock (_eventQueueGate)
+        {
+            if (!_eventQueues.Contains(handle))
+            {
+                return false;
+            }
+
+            if (!_pendingEvents.TryGetValue(handle, out var queue))
+            {
+                queue = new Queue<KernelQueuedEvent>();
+                _pendingEvents[handle] = queue;
+            }
+
+            queue.Enqueue(queuedEvent);
+            return true;
+        }
+    }
+
+    private static int DequeueEvents(CpuContext ctx, ulong handle, ulong eventsAddress, int eventCapacity)
+    {
+        if (eventsAddress == 0 || eventCapacity <= 0)
+        {
+            return 0;
+        }
+
+        KernelQueuedEvent[] events;
+        lock (_eventQueueGate)
+        {
+            if (!_pendingEvents.TryGetValue(handle, out var queue) || queue.Count == 0)
+            {
+                return 0;
+            }
+
+            var count = Math.Min(eventCapacity, queue.Count);
+            events = new KernelQueuedEvent[count];
+            for (var i = 0; i < count; i++)
+            {
+                events[i] = queue.Dequeue();
+            }
+        }
+
+        for (var i = 0; i < events.Length; i++)
+        {
+            if (!WriteKernelEvent(ctx, eventsAddress + ((ulong)i * KernelEventSize), events[i]))
+            {
+                return i;
+            }
+        }
+
+        return events.Length;
+    }
+
+    private static bool WriteKernelEvent(CpuContext ctx, ulong address, KernelQueuedEvent queuedEvent)
+    {
+        Span<byte> eventBytes = stackalloc byte[KernelEventSize];
+        BinaryPrimitives.WriteUInt64LittleEndian(eventBytes[0x00..], queuedEvent.Ident);
+        BinaryPrimitives.WriteInt16LittleEndian(eventBytes[0x08..], queuedEvent.Filter);
+        BinaryPrimitives.WriteUInt16LittleEndian(eventBytes[0x0A..], queuedEvent.Flags);
+        BinaryPrimitives.WriteUInt32LittleEndian(eventBytes[0x0C..], queuedEvent.Fflags);
+        BinaryPrimitives.WriteUInt64LittleEndian(eventBytes[0x10..], queuedEvent.Data);
+        BinaryPrimitives.WriteUInt64LittleEndian(eventBytes[0x18..], queuedEvent.UserData);
+        return ctx.Memory.TryWrite(address, eventBytes);
     }
 
     private static void TraceEventQueue(CpuContext ctx, string operation, ulong handle)
